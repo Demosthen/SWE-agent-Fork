@@ -317,7 +317,7 @@ class ToolHandler:
     def _get_state(self, env: SWEEnv) -> dict[str, str]:
         """Retrieve the state from the environment"""
         try:
-            state_str = env.read_file("/root/state.json")
+            state_str = env.read_file("/root/state.json", errors="backslashreplace")  # SUBAGENT_SWEREX_UTF8_PATCH
         except FileNotFoundError:
             self.logger.warning("State file not found, returning empty state")
             return {}

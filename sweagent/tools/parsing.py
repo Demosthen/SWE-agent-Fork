@@ -34,6 +34,7 @@ Or from the command line: `--agent.tools.parse_function.type=thought_action`.
 """
 
 import json
+import os
 import re
 import textwrap
 from abc import ABC, abstractmethod
@@ -47,6 +48,40 @@ from pydantic import BaseModel
 from sweagent.exceptions import FormatError, FunctionCallingFormatError
 from sweagent.tools.commands import Command
 from sweagent.tools.utils import _should_quote
+
+_HERMES_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+
+def _extract_hermes_tool_call(content: str) -> dict | None:
+    """Recover a Hermes <tool_call>{...}</tool_call> JSON block from content.
+
+    vLLM's hermes parser only populates ``message.tool_calls`` when
+    ``finish_reason == "tool_calls"``. When the model emits the same block but
+    stops via ``finish_reason == "stop"``, the JSON sits in ``content`` and we
+    must parse it ourselves to avoid a 3-retry / exit_format death spiral.
+
+    Returns a dict shaped like ``litellm`` ChatCompletionMessageToolCall.to_dict
+    so the rest of FunctionCallingParser handles it transparently.
+    """
+    match = _HERMES_TOOL_CALL_RE.search(content)
+    if match is None:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    name = payload.get("name")
+    if not isinstance(name, str):
+        return None
+    if isinstance(payload.get("arguments"), dict):
+        arguments = payload["arguments"]
+    else:
+        arguments = {k: v for k, v in payload.items() if k != "name"}
+    return {
+        "id": "hermes-content-fallback",
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments)},
+    }
 
 
 class AbstractParseFunction(ABC):
@@ -219,7 +254,11 @@ class XMLThoughtActionParser(AbstractParseFunction, BaseModel):
 
 
 FN_REGEX_PATTERN = r"<function=([^>]+)>\n(.*?)</function>"
+FN_REGEX_BARE_PATTERN = r"<function=([^>]+)>(?:\n</function>)?"  # SUBAGENT_BARE_FN_PATCH
 FN_PARAM_REGEX_PATTERN = r"<parameter=([^>]+)>(.*?)</parameter>"
+FN_PARAM_ALT_REGEX_PATTERN = r"<parameter>([^<]+)</parameter>(.*?)</parameter>"  # SUBAGENT_PARAM_FORMAT_PATCH
+FN_PARAM_MERGED_REGEX_PATTERN = r'<parameter>"?(\w+)"?[>=](.*?)</parameter>'  # SUBAGENT_MERGED_PARAM_PATCH
+FN_PARAM_PAREN_REGEX_PATTERN = r'<parameter\((\w+)\)?>(.+?)</parameter>'  # SUBAGENT_PAREN_PARAM_PATCH
 
 
 class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
@@ -256,8 +295,11 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
     def __call__(self, model_response: dict, commands: list[Command], strict=False) -> tuple[str, str]:
         fn_match = re.search(FN_REGEX_PATTERN, model_response["message"], re.DOTALL)
         if not fn_match:
-            msg = "No function found in model response."
-            raise FormatError(msg)
+            # Fallback: bare <function=name> without body (e.g. <function=submit>)
+            fn_match = re.search(FN_REGEX_BARE_PATTERN, model_response["message"])
+            if not fn_match:
+                msg = "No function found in model response."
+                raise FormatError(msg)
         fn_name = fn_match.group(1).strip()
 
         # Handle different names in SWE-agent vs. SWE-gym
@@ -266,7 +308,12 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
         if fn_name == "finish":
             fn_name = "submit"
 
-        fn_body = fn_match.group(2)
+        fn_body = fn_match.group(2) if fn_match.lastindex and fn_match.lastindex >= 2 else ""
+        # # SUBAGENT_TRUNCATE_MULTI_FN_PATCH — truncate at next <function= to prevent
+        # parameter contamination from multi-function responses.
+        _next_fn = re.search(r"<function=", fn_body)
+        if _next_fn:
+            fn_body = fn_body[:_next_fn.start()]
         thought = model_response["message"][: fn_match.start()] + model_response["message"][fn_match.end() :]
         thought = thought.strip()
 
@@ -276,9 +323,16 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
             msg = f"Command '{fn_name}' not found in list of available commands."
             raise FormatError(msg)
 
+        _params = re.findall(FN_PARAM_REGEX_PATTERN, fn_body, re.DOTALL)
+        if not _params:  # Fallback: <parameter>name>value</parameter> (merged format)
+            _params = re.findall(FN_PARAM_MERGED_REGEX_PATTERN, fn_body, re.DOTALL)
+        if not _params:  # Fallback: <parameter(name)>value</parameter> (paren format)
+            _params = re.findall(FN_PARAM_PAREN_REGEX_PATTERN, fn_body, re.DOTALL)
+        if not _params:  # Fallback: <parameter>name</parameter>value</parameter>
+            _params = re.findall(FN_PARAM_ALT_REGEX_PATTERN, fn_body, re.DOTALL)
         params_dict = {
             param[0]: re.sub(r"^\n|\n$", "", param[1])
-            for param in re.findall(FN_PARAM_REGEX_PATTERN, fn_body, re.DOTALL)
+            for param in _params
         }
 
         if "view_range" in params_dict:
@@ -439,8 +493,32 @@ class FunctionCallingParser(AbstractParseFunction, BaseModel):
     def __call__(self, model_response: dict, commands: list[Command], strict=False):
         message = model_response["message"]
         tool_calls = model_response.get("tool_calls", None)
-        if tool_calls is None or len(tool_calls) != 1:
-            num_tools = len(tool_calls) if tool_calls else 0
+        num_tools = len(tool_calls) if tool_calls else 0
+        # HERMES_CONTENT_TOOLCALL_FALLBACK — vLLM's hermes parser only converts
+        # <tool_call>{...}</tool_call> into structured tool_calls when finish_reason
+        # is "tool_calls"; when the model emits the same block but stops via "stop",
+        # tool_calls is None and the block sits in message content. Recover by
+        # extracting the first <tool_call> JSON block and synthesizing a tool_call.
+        if num_tools == 0 and isinstance(message, str) and "<tool_call>" in message:
+            extracted = _extract_hermes_tool_call(message)
+            if extracted is not None:
+                tool_calls = [extracted]
+                num_tools = 1
+                model_response["tool_calls"] = tool_calls
+        # SUBAGENT_TAKE_FIRST_TOOL_CALL_PATCH — under structured-outputs guided JSON,
+        # SFT models trained on data where consecutive function_calls were rendered
+        # into the same assistant turn emit >1 tool_calls per response; the default
+        # behaviour burns 3 retries and exits the trajectory in format-error. Gate
+        # "take first" behind an env var so we can A/B it cleanly. We also trim
+        # model_response["tool_calls"] in place so downstream code (agents.py
+        # builds step.tool_call_ids from it and asserts len==1) sees a single
+        # call — otherwise it AssertionErrors on the first multi-call turn.
+        if num_tools > 1 and os.environ.get("SUBAGENT_TAKE_FIRST_TOOL_CALL", "") == "1":
+            model_response["tool_calls"] = [tool_calls[0]]
+            tool_call = tool_calls[0]
+            action = self._parse_tool_call(tool_call, commands)
+            return message, action
+        if num_tools != 1:
             msg = (
                 f"Expected exactly one tool call in model response - received {num_tools} "
                 f"tool calls with message: {message}"

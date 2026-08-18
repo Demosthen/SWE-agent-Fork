@@ -915,7 +915,8 @@ class DefaultAgent(AbstractAgent):
                     PatchFormatter(
                         patch,
                         read_method=lambda path: self._env.read_file(  # type: ignore[attr-defined]
-                            PurePosixPath("/") / self._env.repo.repo_name / path  # type: ignore[attr-defined]
+                            PurePosixPath("/") / self._env.repo.repo_name / path,  # SUBAGENT_SWEREX_UTF8_PATCH
+                            errors="backslashreplace",  # type: ignore[attr-defined]
                         ),
                     )
                     if patch

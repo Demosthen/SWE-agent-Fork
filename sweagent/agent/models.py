@@ -1,3 +1,4 @@
+# SUBAGENT_RLVF_PATCHED — SWE-agent max_tokens for all providers
 from __future__ import annotations
 
 import copy
@@ -50,6 +51,62 @@ litellm.suppress_debug_info = True
 
 _THREADS_THAT_USED_API_KEYS = []
 """Keeps track of thread orders so that we can choose the same API key for the same thread."""
+
+
+# ── SUBAGENT_TOKEN_ID_RECORDER ────────────────────────────────────────────────
+# Phase 0 of docs/ACCUMULATE_TOKENS_SPEC.md.
+#
+# Training currently REBUILDS each trajectory by re-applying a chat template to a
+# message list. vLLM serves with the stock Qwen3 template (which strips
+# prior-turn <think>); our training template retains it. The two disagree, so
+# ~43% of every trained sequence is reasoning the model never conditioned on.
+#
+# The fix is to train on the tokens the model actually saw. That is only sound if
+# each turn's prompt EXTENDS the previous one:
+#
+#     prompt_ids[k+1]  startswith  prompt_ids[k] + token_ids[k]
+#
+# This recorder captures the raw ids so that invariant can be measured before any
+# training code is written. Entirely inert unless SUBAGENT_TOKEN_IDS_PATH is set;
+# never raises into the agent loop.
+_TOKEN_IDS_LOCK = threading.Lock()
+
+
+def _token_ids_path() -> str:
+    return os.environ.get("SUBAGENT_TOKEN_IDS_PATH", "")
+
+
+def _record_token_ids(response: Any, api_base: str | None, logger: Any) -> None:
+    """Append one JSONL record per LLM call. Best-effort; never raises."""
+    path = _token_ids_path()
+    if not path:
+        return
+    try:
+        prompt_ids = getattr(response, "prompt_token_ids", None)
+        choice = response.choices[0] if getattr(response, "choices", None) else None
+        token_ids = getattr(choice, "token_ids", None) if choice is not None else None
+        record = {
+            # api_base carries a port unique to (instance_id, repetition_id), so it
+            # groups turns into trajectories without threading an id through.
+            "api_base": api_base or "",
+            "pid": os.getpid(),
+            "t": time.time(),
+            "prompt_ids": prompt_ids,
+            "token_ids": token_ids,
+            # Recorded so a null result is diagnosable: absent fields mean the
+            # flag did not survive litellm/SkyRL, NOT that the invariant failed.
+            "have_prompt_ids": prompt_ids is not None,
+            "have_token_ids": token_ids is not None,
+        }
+        line = json.dumps(record)
+        with _TOKEN_IDS_LOCK:
+            with open(path, "a") as f:
+                f.write(line + "\n")
+    except Exception as e:  # pragma: no cover - diagnostics must never break a run
+        try:
+            logger.debug(f"token-id recorder failed (ignored): {e}")
+        except Exception:
+            pass
 
 
 class RetryConfig(PydanticBaseModel):
@@ -711,6 +768,22 @@ class LiteLLMModel(AbstractModel):
         completion_kwargs = self.config.completion_kwargs
         if self.lm_provider == "anthropic":
             completion_kwargs["max_tokens"] = self.model_max_output_tokens
+        elif self.model_max_output_tokens:  # SUBAGENT_MAX_TOKENS_ALL_PROVIDERS
+            # Cap EVERY provider, not just anthropic. Without this the vLLM /
+            # SkyRL path sends no max_tokens at all and a single turn can
+            # generate to the full context window. Copy before mutating —
+            # completion_kwargs aliases the shared config object.
+            completion_kwargs = {**completion_kwargs}
+            completion_kwargs.setdefault("max_tokens", self.model_max_output_tokens)
+        # SUBAGENT_TOKEN_ID_RECORDER: ask vLLM to echo the exact prompt/response
+        # token ids so training can ACCUMULATE them rather than re-render a chat
+        # template. Inert unless SUBAGENT_TOKEN_IDS_PATH is set. Copy first —
+        # completion_kwargs aliases the shared config object.
+        if _token_ids_path():
+            completion_kwargs = {**completion_kwargs}
+            _extra_body = {**completion_kwargs.get("extra_body", {})}
+            _extra_body["return_token_ids"] = True
+            completion_kwargs["extra_body"] = _extra_body
         try:
             response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
                 model=self.config.name,
@@ -729,10 +802,18 @@ class LiteLLMModel(AbstractModel):
         except litellm.exceptions.ContentPolicyViolationError as e:
             raise ContentPolicyViolationError from e
         except litellm.exceptions.BadRequestError as e:
-            if "is longer than the model's context length" in str(e):
+            e_str = str(e)  # SUBAGENT_SWEAGENT_MODELS_CTX_PATCH
+            if "is longer than the model's context length" in e_str or "input tokens" in e_str:
                 raise ContextWindowExceededError from e
+            if "Invalid JSON" in e_str or "json_invalid" in e_str:
+                raise FunctionCallingFormatError(
+                    "Model emitted malformed tool_call JSON (likely truncated <think> leaking into arguments). "
+                    "Please respond again with a valid tool call and no stray reasoning text inside arguments.",
+                    "invalid_json",
+                ) from e
             raise
         self.logger.debug(f"Response: {response}")
+        _record_token_ids(response, self.config.api_base, self.logger)
         try:
             cost = litellm.cost_calculator.completion_cost(response, model=self.config.name)
         except Exception as e:
