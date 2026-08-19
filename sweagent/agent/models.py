@@ -6,6 +6,7 @@ import json
 import os
 import random
 import shlex
+import socket
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -56,13 +57,25 @@ _THREADS_THAT_USED_API_KEYS = []
 # ── SUBAGENT_TOKEN_ID_RECORDER ────────────────────────────────────────────────
 # Phase 0 of docs/ACCUMULATE_TOKENS_SPEC.md.
 #
-# Training currently REBUILDS each trajectory by re-applying a chat template to a
-# message list. vLLM serves with the stock Qwen3 template (which strips
-# prior-turn <think>); our training template retains it. The two disagree, so
-# ~43% of every trained sequence is reasoning the model never conditioned on.
+# Training REBUILDS each trajectory by re-applying a chat template to a message
+# list rather than using the ids vLLM sampled.
 #
-# The fix is to train on the tokens the model actually saw. That is only sound if
-# each turn's prompt EXTENDS the previous one:
+# ⚠️ CORRECTED 2026-08-07. This comment used to say the serving template strips
+# prior-turn <think> while the training template retains it, so ~43% of each
+# trained sequence was reasoning the model never conditioned on. That is FALSE
+# for /scratch/d/doseok/models/qwen3-14b-accthink, which ships a custom 361-char
+# PASS-THROUGH template with no think handling at all. Measured: SWE-agent sends
+# <think> in 11192/11192 assistant context messages, the serving template keeps
+# them verbatim, and it is structurally identical to the training template
+# (_KEEP_THINKING_CHAT_TEMPLATE). On 40 trajectories the reconstruction matched
+# the serving render 40/40 and the loss mask covered the generated tokens
+# exactly (442676/442676). The old rationale applies only to a stock-Qwen3
+# serving template.
+#
+# What remains unverified is narrower and is why this recorder still matters:
+# re-encoding is not PROVEN to reproduce vLLM's sampled ids (round-trip
+# idempotence is necessary, not sufficient). Training on the ids the model
+# actually emitted is only sound if each turn's prompt EXTENDS the previous one:
 #
 #     prompt_ids[k+1]  startswith  prompt_ids[k] + token_ids[k]
 #
@@ -76,27 +89,141 @@ def _token_ids_path() -> str:
     return os.environ.get("SUBAGENT_TOKEN_IDS_PATH", "")
 
 
-def _record_token_ids(response: Any, api_base: str | None, logger: Any) -> None:
+def _token_ids_path_for_pid() -> str:
+    """One file per PROCESS.
+
+    Every Ray worker is a separate process appending to the same path, guarded
+    only by a per-process ``threading.Lock``. O_APPEND is not atomic for the
+    multi-MB records this writes (``prompt_ids`` at a 40k context is ~0.3 MB of
+    JSON), least of all on Lustre, so a shared file interleaves and corrupts.
+    The readers glob ``<path>*`` and treat each shard independently.
+    """
+    # ⚠️ PID alone is NOT unique: pids are per-node, so a multi-node Ray/eval run
+    # would have two processes on different hosts appending multi-MB records to
+    # the same `<path>.12345` — the exact interleaving this is meant to prevent.
+    # Hostname disambiguates nodes; pid disambiguates workers on a node.
+    base = _token_ids_path()
+    if not base:
+        return ""
+    return f"{base}.{socket.gethostname()}.{os.getpid()}"
+
+
+def _provider_field(choice: Any, name: str) -> Any:
+    """Read a field litellm relegated to ``provider_specific_fields``.
+
+    ⚠️ litellm's ``convert_to_model_response_object`` keeps only keys declared on
+    its ``Choices`` model and sweeps everything else into
+    ``choice.provider_specific_fields``. vLLM's ``token_ids`` is one of those, so
+    a plain ``getattr(choice, "token_ids")`` is ALWAYS None and the recorder
+    silently captured nothing. Try the attribute first (in case a future litellm
+    promotes it), then the bag.
+    """
+    v = getattr(choice, name, None)
+    if v is not None:
+        return v
+    bag = getattr(choice, "provider_specific_fields", None)
+    if isinstance(bag, dict):
+        return bag.get(name)
+    return None
+
+
+def _record_token_ids(
+    response: Any,
+    api_base: str | None,
+    logger: Any,
+    sampling: dict | None = None,
+) -> None:
     """Append one JSONL record per LLM call. Best-effort; never raises."""
-    path = _token_ids_path()
+    path = _token_ids_path_for_pid()
     if not path:
         return
     try:
         prompt_ids = getattr(response, "prompt_token_ids", None)
         choice = response.choices[0] if getattr(response, "choices", None) else None
-        token_ids = getattr(choice, "token_ids", None) if choice is not None else None
+        token_ids = _provider_field(choice, "token_ids") if choice is not None else None
+        # Per-token sampling logprobs, in the SAME order as token_ids. Two uses:
+        #   1. TOKEN IDENTITY. Training never sees vLLM's sampled ids — it
+        #      re-encodes text from the message history. Recording the sampled
+        #      ids lets that re-encoding be checked against ground truth
+        #      (scripts/check_rollout_token_fidelity.py).
+        #   2. STALENESS. With generator.async_engine=True and
+        #      fully_async.max_staleness_steps>0 the sampling policy can lag the
+        #      policy being updated. The generator supplies
+        #      rollout_logprobs=None, so SkyRL recomputes pi_old with the CURRENT
+        #      policy and the PPO ratio is ~1 by construction — the drift is
+        #      invisible. These are the only record of the true sampling policy.
+        logprobs = None
+        try:
+            lp = getattr(choice, "logprobs", None) if choice is not None else None
+            content = getattr(lp, "content", None) if lp is not None else None
+            if content:
+                logprobs = [getattr(tok, "logprob", None) for tok in content]
+        except Exception:
+            logprobs = None
+        # ⚠️ THE STRING TRAINING ACTUALLY RE-ENCODES.
+        # `swesmith_generator._build_response_ids_and_loss_mask` renders each
+        # assistant turn from `history[i]["content"]`, which is this
+        # `message.content` — litellm's PARSED string, not `decode(token_ids)`.
+        # Comparing decode(token_ids) against a re-encoding of itself only tests
+        # tokenizer round-trip idempotence and would pass even if litellm mangled
+        # the content (e.g. `_parse_content_for_reasoning` lifting a leading
+        # <think>…</think> into `reasoning_content`). Recording the content is
+        # what makes the identity check test the real training path.
+        content = None
+        finish_reason = None
+        reasoning_content = None
+        if choice is not None:
+            msg = getattr(choice, "message", None)
+            if msg is not None:
+                content = getattr(msg, "content", None)
+                reasoning_content = getattr(msg, "reasoning_content", None)
+            finish_reason = getattr(choice, "finish_reason", None)
         record = {
-            # api_base carries a port unique to (instance_id, repetition_id), so it
-            # groups turns into trajectories without threading an id through.
+            # ⚠️ api_base carries a port unique to (instance_id, repetition_id)
+            # ONLY in the multi-server setup. On host-side-spawn the sub-agent
+            # shares the parent's process and api_base, and one eval server
+            # handles many instances, so (pid, api_base) does NOT separate
+            # trajectories. traj_id is the reliable key when the caller sets it.
             "api_base": api_base or "",
+            "traj_id": os.environ.get("SUBAGENT_TRAJ_ID", ""),
             "pid": os.getpid(),
             "t": time.time(),
             "prompt_ids": prompt_ids,
             "token_ids": token_ids,
+            "logprobs": logprobs,
+            "content": content,
+            "reasoning_content": reasoning_content,
+            "finish_reason": finish_reason,
+            # The sampling params the logprobs were produced under. vLLM's
+            # default logprobs_mode="raw_logprobs" returns log-softmax of the RAW
+            # logits — pre temperature/top-p/top-k — so unless the server runs
+            # with --logprobs-mode processed_logprobs AND sampling is
+            # unrestricted (T=1, top_p=1, top_k=-1), these are NOT the behaviour
+            # policy and must not be used as importance-sampling denominators.
+            "sampling": sampling or {},
             # Recorded so a null result is diagnosable: absent fields mean the
             # flag did not survive litellm/SkyRL, NOT that the invariant failed.
             "have_prompt_ids": prompt_ids is not None,
             "have_token_ids": token_ids is not None,
+            "have_logprobs": logprobs is not None,
+            "have_content": content is not None,
+            # A length disagreement here means logprobs cannot be aligned to ids
+            # and MUST NOT be fed to TIS; surfaced rather than silently zipped.
+            "ids_lp_len_match": (
+                None
+                if (token_ids is None or logprobs is None)
+                else len(token_ids) == len(logprobs)
+            ),
+            # vLLM clamps with max(logprob, -9999.0), so a masked/impossible
+            # token arrives FINITE and slips past an isfinite() filter.
+            "n_logprob_null": (
+                None if logprobs is None else sum(1 for x in logprobs if x is None)
+            ),
+            "n_logprob_clamped": (
+                None
+                if logprobs is None
+                else sum(1 for x in logprobs if isinstance(x, (int, float)) and x <= -9000.0)
+            ),
         }
         line = json.dumps(record)
         with _TOKEN_IDS_LOCK:
@@ -775,15 +902,96 @@ class LiteLLMModel(AbstractModel):
             # completion_kwargs aliases the shared config object.
             completion_kwargs = {**completion_kwargs}
             completion_kwargs.setdefault("max_tokens", self.model_max_output_tokens)
+
+        # ⭐⭐ SEND THE GENERATION CAPS EXPLICITLY. Copy first — completion_kwargs
+        # aliases the shared config object, and mutating it would leak across calls.
+        completion_kwargs = {**completion_kwargs}
+
+        # ── max_tokens ─────────────────────────────────────────────────────────
+        # ⚠️ The `anthropic` branch above NEVER FIRES for this project, so
+        # `max_output_tokens` was silently ignored on every request we have ever
+        # made. `lm_provider` is
+        #     litellm.model_cost.get(self.config.name, {}).get("litellm_provider", self.config.name)
+        # and `config.name` is "openai//scratch/d/doseok/models/qwen3-14b-accthink",
+        # which is not a key in litellm's cost table (configs/litellm_models.json
+        # registers only Qwen3-8B/4B/Coder and sets no litellm_provider). So
+        # lm_provider resolves to the literal path string and never equals
+        # "anthropic". Outside that branch max_output_tokens was used only for
+        # cost accounting.
+        #
+        # With max_tokens absent, vLLM applies
+        # `default_max_tokens = max_model_len - prompt_len` (protocol.py:350-353),
+        # i.e. at max_model_len=40960 a 5k prompt authorises a ~36,000-token turn
+        # while the config believes the cap is 4,960. The arm configs assert the
+        # opposite in a load-bearing comment ("SWE-agent sends a FIXED max_tokens
+        # per request, so if the two do not sum to the served window vLLM 400s
+        # every late turn") — that arithmetic rested on a branch never reached.
+        #
+        # MEASURED 2026-08-08 on swesmith_trajs_overfit64_64x6_lr2e4 (150 traj
+        # files, 2186 assistant messages): p50=381, p90=845, p99=2933,
+        # max=6988 tokens; 4 responses (0.18%) exceeded 4960. So the cap was
+        # genuinely unenforced — a tail effect feeding context overflow rather
+        # than a dominant one, but real.
+        #
+        # Set unconditionally when known: every provider we target honours it.
+        if self.model_max_output_tokens:
+            completion_kwargs.setdefault("max_tokens", self.model_max_output_tokens)
+
+        # ── top_k ──────────────────────────────────────────────────────────────
+        # ⚠️ top_k is NOT an OpenAI chat param, so it can only travel in
+        # extra_body. When the request omits it, vLLM fills it from the model's
+        # generation_config.json (`generation_config="auto"` by default,
+        # vllm/config/model.py:237) — which for qwen3-14b-accthink is
+        # top_k=20, top_p=0.95, temperature=0.6. temperature and top_p are sent
+        # explicitly below so those are overridden correctly; top_k was NOT, and
+        # was previously set only inside the recorder guard, i.e. only during
+        # phase-0 diagnostics.
+        #
+        # Consequence: production rollouts sampled from a TOP-20-TRUNCATED policy
+        # while the trainer's importance ratios use the full softmax — a biased
+        # policy-gradient estimator — and rollout diversity was cut, which feeds
+        # the long-standing "~50% zero-variance RLOO groups" problem. It also
+        # means the phase-0 logprob diagnostics measured a distribution that
+        # production never used.
+        #
+        # SUBAGENT_SAMPLING_TOP_K overrides; -1 = unrestricted (the RL default).
+        _top_k = os.environ.get("SUBAGENT_SAMPLING_TOP_K", "-1")
+        try:
+            _top_k_val = int(_top_k)
+        except ValueError:
+            _top_k_val = -1
+        _eb = dict(completion_kwargs.get("extra_body") or {})
+        _eb.setdefault("top_k", _top_k_val)
+        completion_kwargs["extra_body"] = _eb
+
         # SUBAGENT_TOKEN_ID_RECORDER: ask vLLM to echo the exact prompt/response
         # token ids so training can ACCUMULATE them rather than re-render a chat
         # template. Inert unless SUBAGENT_TOKEN_IDS_PATH is set. Copy first —
         # completion_kwargs aliases the shared config object.
         if _token_ids_path():
             completion_kwargs = {**completion_kwargs}
-            _extra_body = {**completion_kwargs.get("extra_body", {})}
+            # `or {}` not `, {}`: a config with an explicit `extra_body: null`
+            # would make the dict-splat raise TypeError HERE, outside the
+            # recorder's try/except, breaking the agent loop for a diagnostic.
+            _extra_body = dict(completion_kwargs.get("extra_body") or {})
             _extra_body["return_token_ids"] = True
+            # ⚠️ MAKE THE REQUEST UNRESTRICTED, don't just describe it.
+            # top_k is not an OpenAI chat param — it can only travel in
+            # extra_body, and nothing in this repo sets it. When the request
+            # omits it, vLLM falls back to the model's generation_config.json,
+            # which for Qwen3-14B is top_k=20. A logprob taken under a truncated
+            # distribution is not the behaviour-policy logprob and cannot be an
+            # importance-sampling denominator. Setting it explicitly overrides
+            # that fallback. Only applied while recording, so normal runs keep
+            # whatever generation_config.json specifies.
+            _extra_body.setdefault("top_k", -1)
             completion_kwargs["extra_body"] = _extra_body
+            # Per-token sampling logprobs. top_logprobs is deliberately NOT set:
+            # we need only the sampled token's own logprob, and asking for
+            # alternatives multiplies the response size by (top_logprobs+1) for
+            # no gain. `logprobs=True` is the OpenAI chat-completions spelling
+            # that vLLM implements; the legacy int form is the completions API.
+            completion_kwargs.setdefault("logprobs", True)
         try:
             response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
                 model=self.config.name,
@@ -813,7 +1021,25 @@ class LiteLLMModel(AbstractModel):
                 ) from e
             raise
         self.logger.debug(f"Response: {response}")
-        _record_token_ids(response, self.config.api_base, self.logger)
+        _record_token_ids(
+            response,
+            self.config.api_base,
+            self.logger,
+            sampling={
+                # What the REQUEST asked for. None means "unset", in which case
+                # vLLM falls back to the model's generation_config.json (which
+                # for Qwen3-14B sets top_k=20) — so an absent value is NOT
+                # equivalent to "unrestricted", and the checker treats it as
+                # unknown rather than safe.
+                "temperature": (
+                    self.config.temperature if temperature is None else temperature
+                ),
+                "top_p": self.config.top_p,
+                # top_k lives in extra_body, never at the top level.
+                "top_k": (completion_kwargs.get("extra_body") or {}).get("top_k"),
+                "logprobs_requested": completion_kwargs.get("logprobs"),
+            },
+        )
         try:
             cost = litellm.cost_calculator.completion_cost(response, model=self.config.name)
         except Exception as e:
