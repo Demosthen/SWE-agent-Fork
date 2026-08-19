@@ -43,7 +43,7 @@ from textwrap import dedent
 from typing import Any, Literal
 
 from jinja2 import Template
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from sweagent.exceptions import FormatError, FunctionCallingFormatError
 from sweagent.tools.commands import Command
@@ -255,6 +255,10 @@ class XMLThoughtActionParser(AbstractParseFunction, BaseModel):
 
 FN_REGEX_PATTERN = r"<function=([^>]+)>\n(.*?)</function>"
 FN_REGEX_BARE_PATTERN = r"<function=([^>]+)>(?:\n</function>)?"  # SUBAGENT_BARE_FN_PATCH
+# Self-closing form <function=name /> (some models emit this for zero-arg tools
+# like submit). Must be matched BEFORE the bare pattern, whose [^>]+ otherwise
+# captures "name /".  # SUBAGENT_SELF_CLOSING_FN_PATCH
+FN_REGEX_SELF_CLOSING_PATTERN = r"<function=([^>\s/]+)\s*/>"
 FN_PARAM_REGEX_PATTERN = r"<parameter=([^>]+)>(.*?)</parameter>"
 FN_PARAM_ALT_REGEX_PATTERN = r"<parameter>([^<]+)</parameter>(.*?)</parameter>"  # SUBAGENT_PARAM_FORMAT_PATCH
 FN_PARAM_MERGED_REGEX_PATTERN = r'<parameter>"?(\w+)"?[>=](.*?)</parameter>'  # SUBAGENT_MERGED_PARAM_PATCH
@@ -292,8 +296,19 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
 
     type: Literal["xml_function_calling"] = "xml_function_calling"
 
+    # ── subagent-rlvf: per-trajectory tool-auth prefixes ──────────────────
+    # When non-empty, every call to a listed tool must include a ``tool_auth``
+    # parameter whose value matches the configured prefix; wrong/missing →
+    # FormatError (a parser-level rejection). See
+    # src/subagent_rlvf/tool_prefixes.py for the sampling/injection.
+    tool_prefixes: dict[str, str] = Field(default_factory=dict)
+
     def __call__(self, model_response: dict, commands: list[Command], strict=False) -> tuple[str, str]:
         fn_match = re.search(FN_REGEX_PATTERN, model_response["message"], re.DOTALL)
+        if not fn_match:
+            # Self-closing <function=name /> — tried BEFORE the bare fallback,
+            # whose [^>]+ would capture "name /" and fail the command lookup.
+            fn_match = re.search(FN_REGEX_SELF_CLOSING_PATTERN, model_response["message"])
         if not fn_match:
             # Fallback: bare <function=name> without body (e.g. <function=submit>)
             fn_match = re.search(FN_REGEX_BARE_PATTERN, model_response["message"])
@@ -334,6 +349,29 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
             param[0]: re.sub(r"^\n|\n$", "", param[1])
             for param in _params
         }
+
+        # ── subagent-rlvf: validate per-trajectory tool_auth prefix ──────
+        # Pop tool_auth here so it never reaches the required/extra-arg check
+        # below (the command bundles don't declare it). When the parser is
+        # configured with tool_prefixes for this tool, missing or wrong value
+        # → FormatError (a parse error, no dispatch).
+        if self.tool_prefixes:
+            expected_prefix = self.tool_prefixes.get(fn_name)
+            got_prefix = params_dict.pop("tool_auth", None)
+            if expected_prefix is not None:
+                if got_prefix is None:
+                    msg = (
+                        f"Tool '{fn_name}' requires parameter "
+                        f'tool_auth="{expected_prefix}" but it was missing.'
+                    )
+                    raise FormatError(msg)
+                if got_prefix != expected_prefix:
+                    msg = (
+                        f"Tool '{fn_name}' rejected: tool_auth value "
+                        f"'{got_prefix}' does not match expected prefix "
+                        f"'{expected_prefix}'."
+                    )
+                    raise FormatError(msg)
 
         if "view_range" in params_dict:
             # Check that value is format as [x, y]
