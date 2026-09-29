@@ -89,6 +89,58 @@ def _token_ids_path() -> str:
     return os.environ.get("SUBAGENT_TOKEN_IDS_PATH", "")
 
 
+# ── SUBAGENT_THINK_FORCE_CLOSE ────────────────────────────────────────────────
+# ⭐ A TURN THAT ENDS INSIDE <think> IS CONTINUED, NOT RETRIED.
+#
+# Measured on the held-out eval of r2eband KL 0.001 step 20: 958 of 978 format
+# requeries (98%) were "No function found", and 99% of those outputs opened
+# <think> and never closed it — the model planned an action ("I'll view
+# core.py…") and emitted EOS (85%), or ran into max_tokens mid-thought (11%).
+# The harness answered with one terse error line, the model did the same thing
+# again, and three requeries later the episode died as exit_format. That share
+# went 2% -> 93% of held-out no-submissions over 20 steps.
+#
+# Instead: when the output opened <think> and did not close it, append the
+# model's own natural close ("\n</think>\n\n" — every sampled close in this
+# model looks like ".\n</think>\n\n<function=…") and CONTINUE the same assistant
+# message (vLLM `continue_final_message`). The stitched turn is returned as one
+# output, so the parser, requery loop and history see an ordinary turn.
+#
+# BUDGET FORCING: the first request is capped at max_tokens - RESERVE so a turn
+# that thinks to the cap still has RESERVE tokens to act in. The whole turn
+# never exceeds the original max_tokens.
+#
+# ⚠️ THE INJECTED TOKENS WERE NOT SAMPLED. They are recorded on the output as
+# `forced_think_close` and travel into the history entry, so the trainer can
+# zero their loss (subagent_rlvf.sample_building). Training on them would be a
+# large off-policy gradient: the policy gave </think> almost no mass there.
+#
+# SUBAGENT_THINK_FORCE_CLOSE=0 disables (restores the requery-only behaviour).
+THINK_CLOSE_INJECT = "\n</think>\n\n"
+
+
+def _think_force_enabled() -> bool:
+    return os.environ.get("SUBAGENT_THINK_FORCE_CLOSE", "1") != "0"
+
+
+def _think_answer_reserve() -> int:
+    try:
+        return max(0, int(os.environ.get("SUBAGENT_THINK_ANSWER_RESERVE", "1024")))
+    except ValueError:
+        return 1024
+
+
+def think_close_injection(partial: str) -> str:
+    """The text appended to an unclosed-think partial output."""
+    # Don't double a newline the model already emitted.
+    return THINK_CLOSE_INJECT[1:] if partial.endswith("\n") else THINK_CLOSE_INJECT
+
+
+def needs_think_close(text: str) -> bool:
+    """True when the output opened <think> and never closed it."""
+    return "<think>" in text and "</think>" not in text
+
+
 def _token_ids_path_for_pid() -> str:
     """One file per PROCESS.
 
@@ -992,6 +1044,20 @@ class LiteLLMModel(AbstractModel):
             # no gain. `logprobs=True` is the OpenAI chat-completions spelling
             # that vLLM implements; the legacy int form is the completions API.
             completion_kwargs.setdefault("logprobs", True)
+        # SUBAGENT_THINK_FORCE_CLOSE — see the block comment at THINK_CLOSE_INJECT.
+        # Only for one plain-text choice: the XML parser reads content, and the
+        # token-id recorder accumulates one response per request, which a
+        # stitched turn would break (it is a diagnostic; forcing stays off there).
+        _force_close = (
+            _think_force_enabled()
+            and n in (None, 1)
+            and not self.tools.use_function_calling
+            and not _token_ids_path()
+        )
+        _turn_budget = int(completion_kwargs.get("max_tokens") or 0)
+        _reserve = _think_answer_reserve()
+        if _force_close and _turn_budget > 2 * _reserve > 0:
+            completion_kwargs = {**completion_kwargs, "max_tokens": _turn_budget - _reserve}
         try:
             response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
                 model=self.config.name,
@@ -1055,10 +1121,87 @@ class LiteLLMModel(AbstractModel):
             cost = 0
         choices: litellm.types.utils.Choices = response.choices  # type: ignore
         n_choices = n if n is not None else 1
+
+        # ── SUBAGENT_THINK_FORCE_CLOSE: continue the turn ────────────────────
+        # Two cases, one mechanism (continue the SAME assistant message):
+        #   A. <think> left open -> inject the close, continue. The injected
+        #      text was not sampled; it is marked for the trainer to mask.
+        #   B. <think> closed (or absent) but the turn hit the REDUCED cap that
+        #      budget forcing imposed -> continue with nothing injected, so the
+        #      reserve never truncates a turn that would have fit in the original
+        #      budget. Everything in B is sampled; nothing to mask.
+        _forced_content: str | None = None
+        _forced_meta: dict[str, Any] | None = None
+        _first = (choices[0].message.content or "") if _force_close else ""
+        _first_finish = getattr(choices[0], "finish_reason", None) if _force_close else None
+        _reserved = _force_close and completion_kwargs.get("max_tokens") != _turn_budget
+        _case_a = _force_close and needs_think_close(_first)
+        _case_b = (not _case_a) and _reserved and _first_finish == "length"
+        if _case_a or _case_b:
+            _inject = think_close_injection(_first) if _case_a else ""
+            _used = getattr(getattr(response, "usage", None), "completion_tokens", None)
+            if not isinstance(_used, int):
+                _used = litellm.utils.token_counter(
+                    text=_first,
+                    model=self.custom_tokenizer["identifier"] if self.custom_tokenizer is not None else self.config.name,
+                    custom_tokenizer=self.custom_tokenizer,
+                )
+            # The whole turn stays within the ORIGINAL budget when one was set.
+            _cont_budget = (_turn_budget - _used) if _turn_budget else (_reserve or 1024)
+            _cont_kwargs = {**completion_kwargs, "max_tokens": max(1, _cont_budget)}
+            _cont_eb = dict(_cont_kwargs.get("extra_body") or {})
+            # vLLM chat extensions: render the last assistant message WITHOUT its
+            # closing <|im_end|> and without a new generation prompt, so the
+            # model resumes inside the same turn right where the text ends.
+            _cont_eb["continue_final_message"] = True
+            _cont_eb["add_generation_prompt"] = False
+            _cont_kwargs["extra_body"] = _cont_eb
+            try:
+                _cont = litellm.completion(  # type: ignore
+                    model=self.config.name,
+                    messages=[*messages, {"role": "assistant", "content": _first + _inject}],
+                    temperature=self.config.temperature if temperature is None else temperature,
+                    top_p=self.config.top_p,
+                    api_version=self.config.api_version,
+                    api_key=self.config.choose_api_key(),
+                    fallbacks=self.config.fallbacks,
+                    **_cont_kwargs,
+                    **extra_args,
+                    n=n,
+                )
+                _cont_text = _cont.choices[0].message.content or ""  # type: ignore
+                _forced_content = _first + _inject + _cont_text
+                # The second request re-sent the whole context plus the partial.
+                input_tokens += input_tokens + _used
+                if _case_a:
+                    _forced_meta = {
+                        # The injected span is the ONLY "</think>" in the turn's
+                        # content up to this point (the sampled prefix has none —
+                        # that is what triggered this), so the trainer locates it
+                        # as the first "</think>". prefix_chars is for inspection.
+                        "prefix_chars": len(_first),
+                        "injected": _inject,
+                        "first_finish_reason": _first_finish,
+                        "first_tokens": _used,
+                    }
+                    self.logger.info(
+                        f"think-close forced: continued an unclosed <think> "
+                        f"({_used} tokens, finish={_first_finish})"
+                    )
+                else:
+                    self.logger.info(f"budget reserve: continued a length-capped turn ({_used} tokens)")
+            except Exception as e:
+                # Never make a turn worse than before: on any failure (context
+                # window, transport) fall back to the unforced output, which the
+                # parser/requery loop handles exactly as it always has.
+                self.logger.warning(f"turn continuation failed, using the unforced output: {e!r}")
+
         outputs = []
         output_tokens = 0
         for i in range(n_choices):
             output = choices[i].message.content or ""
+            if i == 0 and _forced_content is not None:
+                output = _forced_content
             output_tokens += litellm.utils.token_counter(
                 text=output,
                 model=self.custom_tokenizer["identifier"] if self.custom_tokenizer is not None else self.config.name,
@@ -1076,6 +1219,8 @@ class LiteLLMModel(AbstractModel):
                 and response.choices[i].message.thinking_blocks  # type: ignore
             ):
                 output_dict["thinking_blocks"] = response.choices[i].message.thinking_blocks  # type: ignore
+            if i == 0 and _forced_meta is not None:
+                output_dict["forced_think_close"] = _forced_meta
             outputs.append(output_dict)
         self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=cost)
         return outputs

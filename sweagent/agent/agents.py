@@ -725,6 +725,14 @@ class DefaultAgent(AbstractAgent):
                 "thinking_blocks": step.thinking_blocks,
             },
         )
+        # SUBAGENT_THINK_FORCE_CLOSE: mark the entry AFTER _append_history. The
+        # hooks receive the item as **kwargs with a fixed keyword-only signature
+        # (hooks/abstract.py on_query_message_added), so an extra key there
+        # raises TypeError and kills the episode. Never sent to the model either
+        # (_history_to_messages copies role/content/tool_calls only); the
+        # trainer reads it back from the .traj history.
+        if step.extra_info.get("forced_think_close"):
+            self.history[-1]["forced_think_close"] = step.extra_info["forced_think_close"]  # type: ignore[typeddict-unknown-key]
 
         elided_chars = 0
         if step.observation.strip() == "":
@@ -1042,6 +1050,12 @@ class DefaultAgent(AbstractAgent):
             else:
                 output = self.model.query(history)  # type: ignore
             step.output = output["message"]
+            # SUBAGENT_THINK_FORCE_CLOSE: record BEFORE parsing, so a forced turn
+            # that still fails to parse is marked in the trajectory too. The
+            # history entry picks it up in add_step_to_history, which is what the
+            # trainer reads to zero the loss on the injected (unsampled) tokens.
+            if output.get("forced_think_close"):
+                step.extra_info["forced_think_close"] = output["forced_think_close"]
             # todo: Can't I override the parser in __init__?
             step.thought, step.action = self.tools.parse_actions(output)
             step.thinking_blocks = output.get("thinking_blocks", [])
