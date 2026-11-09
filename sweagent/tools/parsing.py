@@ -261,6 +261,20 @@ FN_PARAM_MERGED_REGEX_PATTERN = r'<parameter>"?(\w+)"?[>=](.*?)</parameter>'  # 
 FN_PARAM_PAREN_REGEX_PATTERN = r'<parameter\((\w+)\)?>(.+?)</parameter>'  # SUBAGENT_PAREN_PARAM_PATCH
 
 
+# ── SUBAGENT_XML_ERROR_CODES (opt-in) ─────────────────────────────────────────
+# XMLFunctionCallingParser's error template branches on ``error_code`` (its
+# "missing" branch tells the model what to do), but the parser raised plain
+# FormatError with no code, so every format error rendered the bare
+# "Your action could not be parsed properly: <msg>." and the helpful branches
+# were dead code. With SUBAGENT_XML_ERROR_CODES=1 it raises
+# FunctionCallingFormatError (a FormatError subclass — same requery path) with
+# the code, so the template's branches are reached. Off: unchanged.
+def _xml_format_error(msg: str, code: str) -> FormatError:
+    if os.environ.get("SUBAGENT_XML_ERROR_CODES", "0") == "1":
+        return FunctionCallingFormatError(msg, code)  # type: ignore[arg-type]
+    return FormatError(msg)
+
+
 class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
     """
     Expects the model response to be a tool calling format, where the command and parameters are specified
@@ -274,11 +288,18 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
 
     error_message: str = dedent("""\
     {%- if error_code == "missing" -%}
-    Your last output did not use any tool calls!
-    Please make sure your output includes exactly _ONE_ function call!
-    If you think you have already resolved the issue, please submit your changes by running the `submit` command.
-    If you think you cannot solve the problem, please run `submit`.
-    Else, please continue with a new tool call!
+    Your last output did not contain a tool call, so nothing was executed.
+    Every response must END with exactly ONE function call, written after your reasoning, in this format:
+
+    <function=bash>
+    <parameter=command>ls -la</parameter>
+    </function>
+
+    Do not describe the action in prose — write the call itself.
+    If you have finished the task, call:
+
+    <function=submit>
+    </function>
     {%- elif error_code == "multiple" -%}
     Your last output included multiple tool calls!
     Please make sure your output includes a thought and exactly _ONE_ function call.
@@ -299,7 +320,7 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
             fn_match = re.search(FN_REGEX_BARE_PATTERN, model_response["message"])
             if not fn_match:
                 msg = "No function found in model response."
-                raise FormatError(msg)
+                raise _xml_format_error(msg, "missing")
         fn_name = fn_match.group(1).strip()
 
         # Handle different names in SWE-agent vs. SWE-gym
@@ -321,7 +342,7 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
         command = commands_dict.get(fn_name)
         if not command:
             msg = f"Command '{fn_name}' not found in list of available commands."
-            raise FormatError(msg)
+            raise _xml_format_error(msg, "invalid_command")
 
         _params = re.findall(FN_PARAM_REGEX_PATTERN, fn_body, re.DOTALL)
         if not _params:  # Fallback: <parameter>name>value</parameter> (merged format)
@@ -341,7 +362,7 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
             if isinstance(v, str):
                 if not re.match(r"\[\d+,\s*\d+\]", v):
                     msg = f"view_range must be in the format [<start>, <end>], got {v}."
-                    raise FormatError(msg)
+                    raise _xml_format_error(msg, "incorrect_args")
                 params_dict["view_range"] = json.loads(v)
 
         # Check if all required arguments are there
@@ -349,7 +370,7 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
         missing_args = required_args - params_dict.keys()
         if missing_args:
             msg = f"Required argument(s) missing: {', '.join(missing_args)}"
-            raise FormatError(msg)
+            raise _xml_format_error(msg, "missing_arg")
 
         # Check if all arguments are valid
         valid_args = {arg.name for arg in command.arguments}
@@ -359,7 +380,7 @@ class XMLFunctionCallingParser(AbstractParseFunction, BaseModel):
             extra_args.discard(command.end_name)
         if extra_args:
             msg = f"Unexpected argument(s): {', '.join(extra_args)}"
-            raise FormatError(msg)
+            raise _xml_format_error(msg, "unexpected_arg")
 
         # Format arguments using their individual argument_format
         formatted_args = {
