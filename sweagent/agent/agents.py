@@ -733,6 +733,8 @@ class DefaultAgent(AbstractAgent):
         # trainer reads it back from the .traj history.
         if step.extra_info.get("forced_think_close"):
             self.history[-1]["forced_think_close"] = step.extra_info["forced_think_close"]  # type: ignore[typeddict-unknown-key]
+        if step.extra_info.get("think_prefill"):
+            self.history[-1]["think_prefill"] = step.extra_info["think_prefill"]  # type: ignore[typeddict-unknown-key]
 
         elided_chars = 0
         if step.observation.strip() == "":
@@ -1056,6 +1058,10 @@ class DefaultAgent(AbstractAgent):
             # trainer reads to zero the loss on the injected (unsampled) tokens.
             if output.get("forced_think_close"):
                 step.extra_info["forced_think_close"] = output["forced_think_close"]
+            # SUBAGENT_THINK_PREFILL: the "<think>\n" the harness put at the start
+            # of the turn (not sampled; the trainer zeroes its loss).
+            if output.get("think_prefill"):
+                step.extra_info["think_prefill"] = output["think_prefill"]
             # todo: Can't I override the parser in __init__?
             step.thought, step.action = self.tools.parse_actions(output)
             step.thinking_blocks = output.get("thinking_blocks", [])

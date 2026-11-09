@@ -136,6 +136,42 @@ def think_close_injection(partial: str) -> str:
     return THINK_CLOSE_INJECT[1:] if partial.endswith("\n") else THINK_CLOSE_INJECT
 
 
+# ── SUBAGENT_THINK_PREFILL (opt-in) ───────────────────────────────────────────
+# ⭐ THE FIRST TOKEN OF EVERY TURN IS NOT THE MODEL'S CHOICE.
+#
+# Measured on both SWE-smith runs (thinkforce baseline and + premature-EOS
+# penalty rows): from ~step 24 the policy began opening turns with the literal
+# text "RGBO" instead of "<think>", then wrote its plan as prose and stopped
+# with no call. By step 28 it was 26% of model calls in BOTH runs, and it is what
+# tripped the format-collapse abort (step 30 baseline, step 37 penalty run).
+# Forced continuation and the penalty rows both key on "<think>", so this
+# failure walked straight past them.
+#
+# With SUBAGENT_THINK_PREFILL=1 every request sends an assistant message that
+# already holds "<think>\n" (vLLM continue_final_message), and the returned
+# turn is that prefix + the sampled continuation. The prefix was NOT sampled:
+# it is recorded as `think_prefill` on the output / history entry and the
+# trainer zeroes its loss, exactly like the injected </think>.
+#
+# Every sampled turn of this model starts "<think>\n" (then "\n" or the first
+# word), so the prefix is the model's own opening, not a new format.
+# "<think>" ALONE, not "<think>\n": <think> is an added special token, so this
+# prefix is exactly one token in both the rollout and the trainer's re-encoding.
+# With a trailing "\n" the model's own blank line ("\n\n" = one token, 271)
+# would be sampled as a second "\n" (198) after the prefix but re-encoded as
+# 271 in training — a token-boundary mismatch on the first sampled token.
+# Overridable for experiments via SUBAGENT_THINK_PREFILL_TEXT.
+THINK_PREFILL = "<think>"
+
+
+def _think_prefill_text() -> str:
+    return os.environ.get("SUBAGENT_THINK_PREFILL_TEXT", THINK_PREFILL)
+
+
+def _think_prefill_enabled() -> bool:
+    return os.environ.get("SUBAGENT_THINK_PREFILL", "0") == "1"
+
+
 def needs_think_close(text: str) -> bool:
     """True when the output opened <think> and never closed it."""
     return "<think>" in text and "</think>" not in text
@@ -1048,12 +1084,18 @@ class LiteLLMModel(AbstractModel):
         # Only for one plain-text choice: the XML parser reads content, and the
         # token-id recorder accumulates one response per request, which a
         # stitched turn would break (it is a diagnostic; forcing stays off there).
-        _force_close = (
-            _think_force_enabled()
-            and n in (None, 1)
-            and not self.tools.use_function_calling
-            and not _token_ids_path()
-        )
+        _eligible = n in (None, 1) and not self.tools.use_function_calling and not _token_ids_path()
+        _force_close = _think_force_enabled() and _eligible
+        # SUBAGENT_THINK_PREFILL — see the block comment at THINK_PREFILL.
+        _prefill = _think_prefill_text() if (_think_prefill_enabled() and _eligible) else ""
+        _first_messages = messages
+        if _prefill:
+            _first_messages = [*messages, {"role": "assistant", "content": _prefill}]
+            completion_kwargs = {**completion_kwargs}
+            _pf_eb = dict(completion_kwargs.get("extra_body") or {})
+            _pf_eb["continue_final_message"] = True
+            _pf_eb["add_generation_prompt"] = False
+            completion_kwargs["extra_body"] = _pf_eb
         _turn_budget = int(completion_kwargs.get("max_tokens") or 0)
         _reserve = _think_answer_reserve()
         if _force_close and _turn_budget > 2 * _reserve > 0:
@@ -1061,7 +1103,7 @@ class LiteLLMModel(AbstractModel):
         try:
             response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
                 model=self.config.name,
-                messages=messages,
+                messages=_first_messages,
                 temperature=self.config.temperature if temperature is None else temperature,
                 top_p=self.config.top_p,
                 api_version=self.config.api_version,
@@ -1132,7 +1174,8 @@ class LiteLLMModel(AbstractModel):
         #      budget. Everything in B is sampled; nothing to mask.
         _forced_content: str | None = None
         _forced_meta: dict[str, Any] | None = None
-        _first = (choices[0].message.content or "") if _force_close else ""
+        # The turn as the model sees it: the prefill (if any) + what it sampled.
+        _first = _prefill + (choices[0].message.content or "")
         _first_finish = getattr(choices[0], "finish_reason", None) if _force_close else None
         _reserved = _force_close and completion_kwargs.get("max_tokens") != _turn_budget
         _case_a = _force_close and needs_think_close(_first)
@@ -1200,8 +1243,8 @@ class LiteLLMModel(AbstractModel):
         output_tokens = 0
         for i in range(n_choices):
             output = choices[i].message.content or ""
-            if i == 0 and _forced_content is not None:
-                output = _forced_content
+            if i == 0:
+                output = _forced_content if _forced_content is not None else _first
             output_tokens += litellm.utils.token_counter(
                 text=output,
                 model=self.custom_tokenizer["identifier"] if self.custom_tokenizer is not None else self.config.name,
@@ -1221,6 +1264,8 @@ class LiteLLMModel(AbstractModel):
                 output_dict["thinking_blocks"] = response.choices[i].message.thinking_blocks  # type: ignore
             if i == 0 and _forced_meta is not None:
                 output_dict["forced_think_close"] = _forced_meta
+            if i == 0 and _prefill:
+                output_dict["think_prefill"] = _prefill
             outputs.append(output_dict)
         self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=cost)
         return outputs
